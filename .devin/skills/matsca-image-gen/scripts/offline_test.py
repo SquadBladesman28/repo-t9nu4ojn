@@ -611,25 +611,31 @@ def test_default_race_and_coverage_on():
 
 
 def test_manifest_live_partial_progress():
-    """中途 manifest 反映部分进展：running 内容的部分图计入 saved_images，
-    pending 项带 n_got/saved，轮询方不再卡在 all-pending。"""
+    """中途 manifest 反映部分进展（成败看 manifest）：任何已落盘≥1 张的内容都进 results[]
+    并带 saved[]（部分成功标 complete:False），只有 0 图的内容才进 pending/errors。"""
     outdir = tempfile.mkdtemp()
     t_done = G.Task(1, "甲", "p1", 2, "auto", "m")
     t_done.status = "completed"
+    t_done.got = 2
     t_done.results = [{"path": "/x/a.png", "role": "primary"},
                       {"path": "/x/a2.png", "role": "backup"}]
     t_part = G.Task(2, "乙", "p2", 2, "auto", "m")
     t_part.status = "running"
+    t_part.got = 1
     t_part.results = [{"path": "/x/b.png", "role": "primary"}]   # 2 张里已落 1
     t_wait = G.Task(3, "丙", "p3", 1, "auto", "m")
     t_wait.status = "waiting"
     path, m = G.write_manifest(outdir, [t_done, t_part, t_wait])
     # 已落盘总张数 = 2 + 1 + 0 = 3（含未跑完内容的部分图）
     assert m["saved_images"] == 3, m["saved_images"]
-    assert m["completed"] == 1 and m["pending_count"] == 2, m
+    # 甲(2/2) 与 乙(1/2 在跑) 都在 results；丙(0 图) 在 pending
+    assert m["pending_count"] == 1, m
+    res = {r["name"]: r for r in m["results"]}
+    assert res["甲"]["complete"] is True and res["甲"]["ok"] is True, res["甲"]
+    assert res["乙"]["complete"] is False and res["乙"]["n_got"] == 1, res["乙"]
+    assert res["乙"]["saved"] and res["乙"]["status"] == "running", res["乙"]
     pend = {p["name"]: p for p in m["pending"]}
-    assert pend["乙"]["n_got"] == 1 and pend["乙"]["n_requested"] == 2, pend["乙"]
-    assert pend["乙"]["saved"] and pend["丙"]["n_got"] == 0, pend
+    assert pend["丙"]["n_got"] == 0 and not pend["丙"]["saved"], pend
     assert m["ok"] is False
     print("PASS test_manifest_live_partial_progress")
 
@@ -727,6 +733,68 @@ def test_make_preview_compresses():
     print("PASS test_make_preview_compresses")
 
 
+def _dispatch_accounting(sch, task, n=1):
+    """模拟 _dispatch_locked 的在飞计数，便于直接喂事件测 _handle_event。"""
+    kid = sch.key_order[0]
+    task.inflight += 1
+    task.inflight_images += n
+    task.issued += 1
+    sch.keys[kid].running += 1
+    sch.per_key_inflight[kid] += 1
+    sch.global_inflight += 1
+
+
+def test_race_late_success_recovers_failed_task():
+    """赛马回归（成败看 manifest）：同内容多 n=1 兄弟请求耗尽重试、内容已被标 failed(0 图)后，
+    晚到的成功仍把图落盘 → 必须把 failed 翻成 completed，并在 manifest results[] 带 saved[]，
+    绝不让磁盘上的图在 manifest 隐身（这正是仙人掌实战暴露的 bug）。"""
+    outdir = tempfile.mkdtemp()
+    task = G.Task(1, "成株", "p", 2, "auto", "m")
+    kh = G.KeyHealth("k1", "raw1")
+    sch = G.Scheduler([task], [kh], outdir, timeout=5, race=True, coverage_first=True)
+    # 喂够 5 次可重试错误把重试耗尽（retry_count 0→4，第 5 次置 exhausted），在飞清零 → 标 failed
+    for _ in range(G.MAX_TRANSIENT_TASK_RETRIES + 1):
+        _dispatch_accounting(sch, task, 1)
+        sch._handle_event(("err", task, "k1", 1,
+                           G.RequestError("502 Bad Gateway", status=502, code="")))
+    assert task.status == "failed" and task.got == 0, (task.status, task.got)
+    # 此时一张晚到的成功落盘 → 状态必须从 failed 翻回 completed(部分)
+    _dispatch_accounting(sch, task, 1)
+    sch._handle_event(("ok", task, "k1", 1,
+                       [{"data": b"\x89PNG_fake", "format": "png"}]))
+    assert task.status == "completed", task.status
+    assert task.got == 1 and len(task.results) == 1, (task.got, task.results)
+    _, m = G.write_manifest(outdir, sch.tasks)
+    names_in_results = {r["name"] for r in m["results"]}
+    names_in_errors = {e["name"] for e in m["errors"]}
+    assert "成株" in names_in_results and "成株" not in names_in_errors, m
+    r = next(r for r in m["results"] if r["name"] == "成株")
+    assert r["saved"] and r["n_got"] == 1 and r["complete"] is False, r
+    assert m["saved_images"] == 1, m["saved_images"]
+    print("PASS test_race_late_success_recovers_failed_task")
+
+
+def test_manifest_never_hides_disk_images():
+    """write_manifest 防御性回归：任何已落盘≥1 张的内容一律进 results[] 并带 saved[]——
+    哪怕 status 仍是 failed（兄弟请求把内容标死但图已在盘上），也绝不丢进 errors[] 隐身。"""
+    outdir = tempfile.mkdtemp()
+    t_orphan = G.Task(1, "甲", "p1", 2, "auto", "m")
+    t_orphan.status = "failed"           # 兄弟请求误标 failed
+    t_orphan.got = 1
+    t_orphan.results = [{"path": "/x/a.png", "role": "primary"}]  # 但图已落盘
+    t_dead = G.Task(2, "乙", "p2", 1, "auto", "m")
+    t_dead.status = "failed"             # 真 0 图失败
+    t_dead.error = "502"
+    _, m = G.write_manifest(outdir, [t_orphan, t_dead])
+    res = {r["name"]: r for r in m["results"]}
+    err = {e["name"] for e in m["errors"]}
+    assert "甲" in res and "甲" not in err, m
+    assert res["甲"]["saved"] and res["甲"]["complete"] is False, res["甲"]
+    assert "乙" in err, m            # 真 0 图失败仍进 errors
+    assert m["saved_images"] == 1 and m["failed"] == 1, m
+    print("PASS test_manifest_never_hides_disk_images")
+
+
 if __name__ == "__main__":
     test_concurrency_caps()
     test_single_call_n()
@@ -760,6 +828,8 @@ if __name__ == "__main__":
     # Phase 5 默认常开 + manifest 实时部分进展
     test_default_race_and_coverage_on()
     test_manifest_live_partial_progress()
+    test_race_late_success_recovers_failed_task()
+    test_manifest_never_hides_disk_images()
     # Phase 6 回传预览压缩 + 看护自动回传
     test_preview_target_size()
     test_auto_deliver_collect_and_new()

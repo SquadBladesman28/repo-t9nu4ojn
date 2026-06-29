@@ -899,15 +899,22 @@ class Scheduler:
                 log("增量写 manifest 失败（忽略）：%s" % e)
 
     def _maybe_finalize(self, task):
-        """按已出图数决定收尾：凑齐→completed；无法再继续时，有主图→completed(部分)，否则 failed。"""
-        if task.status in ("completed", "failed"):
+        """按已落盘图数决定收尾（成败看 manifest）：凑齐→completed；只要出过≥1 张就绝不回退成 failed
+        （赛马下多个 n=1 兄弟请求共享一个 task：晚到的成功也能把先前误判的 failed 翻成 completed(部分)）；
+        一张都没有且无法再继续→failed。completed 为终态、不再翻转。"""
+        if task.status == "completed":
             return
         if task.got >= task.need:
             task.status = "completed"
             return
+        if task.got >= 1:
+            # 已出至少一张：要么还想要更多（继续派/等退避），要么收尾为部分成功——但绝不 failed
+            task.status = "completed" if (task.exhausted and task.inflight == 0) else "waiting"
+            return
+        # 一张都没有
         if task.exhausted and task.inflight == 0:
-            task.status = "completed" if task.got >= 1 else "failed"
-            if task.status == "failed":
+            if task.status != "failed":
+                task.status = "failed"
                 log("失败 [%s]：%s" % (task.name, task.error or "无图片返回"))
         else:
             task.status = "waiting"  # 还想要更多图（继续派/等退避）
@@ -1201,23 +1208,35 @@ def _dedupe_names(tasks):
 
 def write_manifest(outdir, tasks, extra=None):
     results, errors, pending = [], [], []
+    incomplete = 0  # 已出图但没凑齐 need 的内容数（部分成功）——top-level ok 要据此置 False
     for t in sorted(tasks, key=lambda x: x.index):
-        if t.status == "completed" and t.results:
-            results.append({"name": t.name, "index": t.index, "prompt": t.prompt,
-                            "ok": True, "key_id": t.key_id, "size": t.size,
-                            "n_requested": t.n, "n_got": len(t.results),
-                            "saved": t.results})
+        terminal = t.status in ("completed", "failed")
+        if t.results:
+            # 成败看 manifest：只要已落盘≥1 张，就一律登记到 results 并附 saved[]，绝不让磁盘上的图在 manifest 隐身
+            # （赛马下兄弟请求失败可能把内容标 failed，但它的图已经在盘上——这里按图为准）
+            complete = len(t.results) >= t.need
+            if terminal and not complete:
+                incomplete += 1
+            entry = {"name": t.name, "index": t.index, "prompt": t.prompt,
+                     "ok": complete, "complete": complete, "key_id": t.key_id, "size": t.size,
+                     "n_requested": t.n, "n_got": len(t.results), "saved": list(t.results)}
+            if not complete:
+                entry["status"] = t.status
+                entry["note"] = "部分成功" if terminal else "进行中"
+                if t.error:
+                    entry["error"] = t.error
+            results.append(entry)
         elif t.status == "failed":
             errors.append({"name": t.name, "index": t.index, "prompt": t.prompt,
                            "error": t.error or "无图片返回", "key_id": t.key_id})
-        else:  # waiting / running —— 尚未跑完，别误记成失败；带上已落盘的部分进度供轮询读
+        else:  # waiting / running 且尚无图 —— 别误记成失败
             pending.append({"name": t.name, "index": t.index, "prompt": t.prompt,
                             "status": t.status, "retry_count": t.retry_count,
-                            "n_requested": t.n, "n_got": len(t.results),
-                            "saved": list(t.results)})
+                            "n_requested": t.n, "n_got": 0, "saved": []})
     manifest = {"created_at": _utc_ts(), "results": results, "errors": errors,
                 "pending": pending,
-                "ok": not errors and not pending,
+                # ok 仅当：无失败、无在跑、且每个内容都凑齐了 need（部分成功也算未完全 ok）
+                "ok": not errors and not pending and incomplete == 0,
                 # 已落盘总张数（含未跑完内容的部分图），反映“现在手上有几张”，供轮询看真实进展
                 "saved_images": sum(len(t.results) for t in tasks),
                 "completed": len(results), "failed": len(errors), "pending_count": len(pending)}
