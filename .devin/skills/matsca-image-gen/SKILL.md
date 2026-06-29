@@ -85,6 +85,38 @@ MATSCA_DEV_PASSWORD=******
 
 判活只看 manifest，别去数操作系统进程。
 
+## 交付与回传：全部图（含备份）+ 压缩预览
+
+把结果交给用户时，按 manifest 的 `results[].saved` 落地/回传，注意两点：
+
+1. **每一张都要给，别只挑主图。** 默认 `-n 2` 时每内容有主图 + `（备1）`，备份和主图同等是产物；交付/回传时把 `saved[]` 里的**每张（含 backup）都按原命名带上**，落到对应目录（图→`output/fig/`），不要只发主图把备份漏在原地。
+2. **回传/嵌网页用压缩预览，原图照旧保留。** 原图 1024² PNG 约 1.7MB/张，走隧道分块回传偏大、嵌页也重。用随附 `scripts/make_preview.py` 压成 ≤900px、q≈82 的 JPEG（约 50–160KB，肉眼几乎无差）再回传/嵌页：
+
+   ```bash
+   # 把整个出图目录压成预览（默认落各图同级 ./preview/），原 PNG 不动
+   python scripts/make_preview.py output/fig --max-px 900 --quality 82
+   ```
+
+   后端优先 Pillow，无则回退 ImageMagick `convert`。生成网页/文档配图时优先引用预览 JPEG，体积小、加载快。
+
+### 经隧道在云端跑：交给看护进程自动回传，别用 LLM 轮询烧 token
+
+云端（如 Devin）经隧道给用户出图时，**不要让模型在轮询循环里干等**——每轮 `读 manifest` 都是对话开销，最后一张卡死时干等更浪费。改用随附 `scripts/auto_deliver.py`：它**跑在云端自己的机器上**（不在用户电脑上），盯 `manifest.json`，每落一张新图（含备份）就自动压预览、经隧道推到用户机对应目录、sha256 自校验，已传的记进 `.delivered.json` 不重发。
+
+```bash
+# 1) 后台出图，记下 PID
+nohup python scripts/gen_image.py --prompts-file jobs.json --outdir out --secrets-file s.env \
+     > out/run.log 2>&1 & echo $! > out/gen.pid
+# 2) 后台起看护（在云端机器，不在用户电脑），出一张自动回传一张
+nohup python scripts/auto_deliver.py --outdir out \
+     --tunnel http://xxxx.cpolar.cn/api/exec --token "Bearer ..." \
+     --remote-dir "d:\\path\\output\\fig" \
+     --gen-pid "$(cat out/gen.pid)" --deadline-min 60 \
+     > out/deliver.log 2>&1 &
+```
+
+模型只管"点火 + 撒手"，之后零对话 token。看护**绝不无限跑**，满足任一条件即收尾退出并把"已交付/缺失"写进日志：① manifest `ok`（全出齐）；② `--gen-pid` 进程结束（含重试用尽放弃的图）；③ `--max-idle-min` 内无新图（兜底卡死）；④ `--deadline-min` 总时限。卡死的最后一张会被 gen 标 `failed`、看护随之收尾，不会一直挂。
+
 ## 可选开关
 
 **赛马 `--race` 与覆盖优先 `--coverage-first` 默认常开**（早交付、多内容先各凑一张）；其余开关默认关闭、显式开启才生效。详细取舍见 `references/matsca-image-gen-notes.md`。
@@ -112,4 +144,4 @@ MATSCA_DEV_PASSWORD=******
 
 - 事实规格（端点、参数白名单、错误码与可重试性、manifest schema、退出码、并发/重试/冷却常量）→ `references/matsca-api.md`
 - 设计原理与排错心法（多 Key 健康调度、逐 Key 冷却、两层重试、为何允许 ping、各开关的取舍、隧道脱离）→ `references/matsca-image-gen-notes.md`
-- 干活的实现 → `scripts/gen_image.py`；不联网的策略自测 → `scripts/offline_test.py`
+- 干活的实现 → `scripts/gen_image.py`；回传/嵌页用的压缩预览 → `scripts/make_preview.py`；云端经隧道出图的看护+自动回传（不烧 token）→ `scripts/auto_deliver.py`；不联网的策略自测 → `scripts/offline_test.py`

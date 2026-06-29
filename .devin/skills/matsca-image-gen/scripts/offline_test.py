@@ -10,6 +10,7 @@
   6. preflight ping 解析 banned
 """
 import base64
+import json
 import os
 import sys
 import tempfile
@@ -633,6 +634,99 @@ def test_manifest_live_partial_progress():
     print("PASS test_manifest_live_partial_progress")
 
 
+def test_preview_target_size():
+    """回传预览缩放数学：最长边压到 ≤max_px、等比、不超则原样。纯函数，免依赖。"""
+    import make_preview as MP
+    assert MP.target_size(1024, 1024, 900) == (900, 900)
+    assert MP.target_size(1600, 900, 900) == (900, 506)   # 等比，最长边=900
+    assert MP.target_size(800, 600, 900) == (800, 600)    # 本就不超，原样
+    assert MP.target_size(900, 450, 900) == (900, 450)    # 边界相等不缩
+    print("PASS test_preview_target_size")
+
+
+def test_auto_deliver_collect_and_new():
+    """看护汇总：完成 + 未跑完内容的部分图都纳入（含备份），按 path 去重挑新图。"""
+    import auto_deliver as AD
+    manifest = {
+        "results": [{"name": "甲", "saved": [
+            {"path": "/o/甲.png", "role": "primary"},
+            {"path": "/o/甲（备1）.png", "role": "backup"}]}],
+        "pending": [{"name": "乙", "saved": [{"path": "/o/乙.png", "role": "primary"}]}],
+        "ok": False,
+    }
+    allsaved = AD.collect_saved(manifest)
+    assert len(allsaved) == 3, allsaved          # 含备份 + 未完成内容的部分图
+    paths = {x["path"] for x in allsaved}
+    assert "/o/甲（备1）.png" in paths and "/o/乙.png" in paths, paths
+    fresh = AD.new_items(manifest, delivered={"/o/甲.png"})
+    assert {x["path"] for x in fresh} == {"/o/甲（备1）.png", "/o/乙.png"}, fresh
+    print("PASS test_auto_deliver_collect_and_new")
+
+
+def test_auto_deliver_finish_conditions():
+    """看护收尾：ok / 进程结束 / idle / deadline 任一成立即退；否则继续。"""
+    import auto_deliver as AD
+    m_open = {"ok": False}
+    m_done = {"ok": True}
+    # 全出齐 → 收尾
+    assert AD.is_finished(m_done, True, False, False)[0] is True
+    # 进程已结束（含放弃的图）→ 收尾
+    assert AD.is_finished(m_open, False, False, False)[0] is True
+    # idle 超限 → 收尾
+    assert AD.is_finished(m_open, True, True, False)[0] is True
+    # deadline 到 → 收尾
+    assert AD.is_finished(m_open, True, False, True)[0] is True
+    # 都没满足 → 继续跑
+    assert AD.is_finished(m_open, True, False, False)[0] is False
+    print("PASS test_auto_deliver_finish_conditions")
+
+
+def test_auto_deliver_run_loop():
+    """看护主循环（mock 上传/压缩，不联网）：manifest.ok 时一轮内交付全部并退 0。"""
+    import auto_deliver as AD
+    outdir = tempfile.mkdtemp()
+    with open(os.path.join(outdir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"ok": True, "errors": [], "results": [
+            {"name": "甲", "saved": [{"path": "/o/甲.png", "role": "primary"},
+                                     {"path": "/o/甲（备1）.png", "role": "backup"}]}],
+            "pending": []}, f, ensure_ascii=False)
+    sent = []
+    orig_up, orig_mp = AD.upload, AD.MP.make_preview
+    AD.upload = lambda *a, **k: True
+    AD.MP.make_preview = lambda src, dst, *a, **k: sent.append(src) or dst
+    try:
+        args = AD.build_parser().parse_args([
+            "--outdir", outdir, "--tunnel", "http://x/api/exec",
+            "--token", "Bearer t", "--remote-dir", "d:\\out\\fig", "--poll-sec", "0"])
+        rc = AD.run(args)
+    finally:
+        AD.upload, AD.MP.make_preview = orig_up, orig_mp
+    assert rc == 0, rc
+    assert set(sent) == {"/o/甲.png", "/o/甲（备1）.png"}, sent   # 主图+备份都发
+    assert AD._load_state(os.path.join(outdir, ".delivered.json")) == set(sent)
+    print("PASS test_auto_deliver_run_loop")
+
+
+def test_make_preview_compresses():
+    """make_preview 把大图压成更小的 JPEG（有 Pillow/convert 才跑，否则跳过）。"""
+    import make_preview as MP
+    try:
+        from PIL import Image
+    except ImportError:
+        print("SKIP test_make_preview_compresses（无 Pillow）")
+        return
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "big.png")
+    Image.new("RGB", (1024, 1024), (123, 200, 88)).save(src)
+    dst = os.path.join(d, "preview", "big.jpg")
+    out = MP.make_preview(src, dst, max_px=900, quality=82)
+    assert out == dst and os.path.exists(dst), out
+    w, h = Image.open(dst).size
+    assert max(w, h) <= 900, (w, h)
+    assert os.path.getsize(dst) < os.path.getsize(src), "预览应比原图小"
+    print("PASS test_make_preview_compresses")
+
+
 if __name__ == "__main__":
     test_concurrency_caps()
     test_single_call_n()
@@ -666,4 +760,10 @@ if __name__ == "__main__":
     # Phase 5 默认常开 + manifest 实时部分进展
     test_default_race_and_coverage_on()
     test_manifest_live_partial_progress()
+    # Phase 6 回传预览压缩 + 看护自动回传
+    test_preview_target_size()
+    test_auto_deliver_collect_and_new()
+    test_auto_deliver_finish_conditions()
+    test_auto_deliver_run_loop()
+    test_make_preview_compresses()
     print("\nALL OFFLINE TESTS PASSED")
