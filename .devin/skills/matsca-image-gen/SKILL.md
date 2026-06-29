@@ -18,8 +18,8 @@ description: 通过 https://img.matsca.com（矩岩 Matsca）上的 OpenAI 兼�
 ## 快速开始
 
 ```bash
-# 单张：Key 走环境变量（推荐，见「密钥来源」），脚本零配置自动读
-python scripts/gen_image.py "一只戴贝雷帽的橘猫，扁平插画风"
+# 单张：Key 从本地 secrets.env 自动读（见「密钥来源」）
+python scripts/gen_image.py "一只戴贝雷帽的橘猫，扁平插画风" --secrets-file D:\700_Resources\720_Agents\secrets.env
 
 # 也可临时直接传裸 Key（逗号分隔，多把即自动开启健康调度+故障转移）
 python scripts/gen_image.py "赛博朋克城市夜景" --keys "k1,k2,k3"
@@ -38,18 +38,7 @@ python scripts/gen_image.py --ping-only
 
 默认就能跑，尽量别拿默认值去烦用户：每内容出 `-n 2`（主图 + 备1）、`--size auto`、`--model gpt-image-2`、落盘到 `output/fig/`、文件名 `<描述>_<日期>.png`（主图无后缀，备份带 `（备1）/（备2）`）。
 
-## 密钥来源
-
-脚本按这个优先级找 Key，命中即止：
-
-1. `--keys "k1,k2,k3"`（临时显式传入）
-2. 环境变量 `MATSCA_API_KEYS` / `MATSCA_API_KEY`（逗号分隔）
-3. `--secrets-file` 指定的 / 默认搜索到的 `secrets.env` 里的 `MATSCA_API_KEYS=`
-4. dev 登录自动 reveal：`--dev-token` 或 `--email`+`--password`，或环境 `MATSCA_DEV_EMAIL`+`MATSCA_DEV_PASSWORD`，或 `secrets.env` 里的同名凭据——脚本会自动登录、列 Key、reveal 出明文 Key
-
-所有 Key 按直连处理，不分模式；多把自动开健康调度 + 故障转移。
-
-### 本地 secrets.env 为准 + 过期自愈（推荐）
+## 密钥来源：以本地 secrets.env 为准 + 过期自愈
 
 以本机 `secrets.env`（如 `D:\700_Resources\720_Agents\secrets.env`）为唯一真源，里面同时放两样、用 `--secrets-file` 指向它：
 
@@ -59,11 +48,13 @@ MATSCA_DEV_EMAIL=you@example.com      # dev 账号——静态 Key 失效时的�
 MATSCA_DEV_PASSWORD=******
 ```
 
-静态 Key 还有效就直连（命 3）；一旦失效/缺失，脚本用 dev 凭据自动登录 reveal 一批新鲜 Key（命 4），**并把新 Key 回写这同一份 `secrets.env`**（只换 `MATSCA_API_KEYS=` 一行，dev 凭据与注释原样保留）。于是下次直接直连、不必再登录，过期了又自动补——本地文件始终是最新真源，不用手动更新 Key、也不用搞环境变量。
+静态 `MATSCA_API_KEYS` 还有效就直接拿来用；一旦失效/缺失，脚本用文件里的 dev 凭据自动登录 reveal 一批新鲜 Key，**并把新 Key 回写这同一份 `secrets.env`**（只换 `MATSCA_API_KEYS=` 一行，dev 凭据与注释原样保留）。于是下次直接直连、不必再登录，过期了又自动补——本地文件始终是最新真源，不用手动更新 Key、也不用搞环境变量。
 
 - 回写默认开；`--no-save-keys` 关掉，`--save-keys-file <路径>` 改回写目标。
 - `secrets.env` 始终被 `.gitignore` 排除、永不进仓，私有不外泄。
 - 经隧道在云端用时：Devin 跑通后同理把新鲜 Key 写回你本机的 `secrets.env`。
+
+所有 Key 按直连处理，不分模式；多把自动开健康调度 + 故障转移。临时想绕开文件，也可 `--keys "k1,k2,k3"` 直接传裸 Key（最高优先）。
 
 ## 结果判定：以 manifest.json 为准
 

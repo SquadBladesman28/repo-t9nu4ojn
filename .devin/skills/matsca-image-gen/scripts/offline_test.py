@@ -555,6 +555,50 @@ def test_save_keys_to_secrets_roundtrip():
     print("PASS test_save_keys_to_secrets_roundtrip")
 
 
+def test_stale_static_keys_self_heal():
+    """静态 Key 全失效但有 dev 凭据 → 自动 reveal 新鲜 Key 顶上，并标记需回写。"""
+    import tempfile as _t, argparse
+    p = os.path.join(_t.mkdtemp(), "secrets.env")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("MATSCA_API_KEYS=stale1,stale2\nMATSCA_DEV_EMAIL=a@b.com\nMATSCA_DEV_PASSWORD=pw\n")
+    args = argparse.Namespace(keys=None, secrets_file=p, dev_token=None, email=None, password=None)
+    orig_ping, orig_reveal = G.ping_server, G._reveal_keys_via_token
+    G.ping_server = lambda raw: {"auth": {"banned": False}} if False else (_ for _ in ()).throw(
+        G.RequestError("401 unauthorized", status=401))   # 所有静态 Key ping 失败
+    G._reveal_keys_via_token = lambda token: [("fresh1", "fr1"), ("fresh2", "fr2")]
+    try:
+        # 没 token 时走 /api/dev/login；用环境变量塞个 token 跳过真实登录
+        os.environ["MATSCA_DEV_TOKEN"] = "tkn"
+        keys = G.resolve_keys(args)
+        assert [k for k, _ in keys] == ["fresh1", "fresh2"], keys
+        assert args._keys_from_reveal is True
+        assert args._secrets_target == p, args._secrets_target
+    finally:
+        G.ping_server, G._reveal_keys_via_token = orig_ping, orig_reveal
+        os.environ.pop("MATSCA_DEV_TOKEN", None)
+    print("PASS test_stale_static_keys_self_heal")
+
+
+def test_healthy_static_keys_no_reveal():
+    """静态 Key 健康 → 直接用，不触发 reveal、不标记回写。"""
+    import tempfile as _t, argparse
+    p = os.path.join(_t.mkdtemp(), "secrets.env")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("MATSCA_API_KEYS=good1,good2\nMATSCA_DEV_EMAIL=a@b.com\nMATSCA_DEV_PASSWORD=pw\n")
+    args = argparse.Namespace(keys=None, secrets_file=p, dev_token=None, email=None, password=None)
+    orig_ping = G.ping_server
+    G.ping_server = lambda raw: {"auth": {"banned": False}}
+    try:
+        os.environ["MATSCA_DEV_TOKEN"] = "tkn"
+        keys = G.resolve_keys(args)
+        assert [k[1] for k in keys] == ["good1", "good2"], keys
+        assert args._keys_from_reveal is False
+    finally:
+        G.ping_server = orig_ping
+        os.environ.pop("MATSCA_DEV_TOKEN", None)
+    print("PASS test_healthy_static_keys_no_reveal")
+
+
 if __name__ == "__main__":
     test_concurrency_caps()
     test_single_call_n()
@@ -583,4 +627,6 @@ if __name__ == "__main__":
     test_parse_json_html_truncated()
     test_initial_manifest_written_before_first_event()
     test_save_keys_to_secrets_roundtrip()
+    test_stale_static_keys_self_heal()
+    test_healthy_static_keys_no_reveal()
     print("\nALL OFFLINE TESTS PASSED")

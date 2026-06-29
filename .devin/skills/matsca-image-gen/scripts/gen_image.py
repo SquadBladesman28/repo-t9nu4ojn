@@ -386,12 +386,62 @@ def _candidate_secrets_files(explicit):
     return out
 
 
-def resolve_keys(args):
-    """返回 [(key_id, raw_key)]。优先 --keys，其次 secrets 文件/环境，最后 dev-token 流程。
+def _resolve_dev_creds(args):
+    """凑齐 dev 登录凭据：--dev-token / --email,--password，否则从本地 secrets.env 读。
+    返回 (token, email, password, secrets_file)；secrets_file 是读到凭据的那份文件（回写目标）。"""
+    token = args.dev_token or os.environ.get("MATSCA_DEV_TOKEN")
+    email = args.email or os.environ.get("MATSCA_DEV_EMAIL")
+    password = args.password or os.environ.get("MATSCA_DEV_PASSWORD")
+    sf_used = None
+    if not token and not (email and password):
+        for sf in _candidate_secrets_files(args.secrets_file):
+            creds = _read_dev_creds(sf)
+            if creds:
+                email, password = email or creds[0], password or creds[1]
+                sf_used = sf
+                break
+    return token, email, password, sf_used
 
-    同时在 args 上记两样元信息供回写用：
-      _keys_from_reveal —— 本次 Key 是不是 dev 登录 reveal 来的（即静态 Key 已失效/缺失）；
-      _secrets_target   —— 该把新鲜 Key 回写到哪个 secrets 文件（保持“本地 secrets 为准”）。
+
+def _reveal_via_creds(token, email, password):
+    """有 token 直接 reveal；只有账号密码就先 /api/dev/login 换 token 再 reveal。
+    多给几次重试，好骑过上游 502 风暴（dev API 也会受 502 影响）。"""
+    if not token and email and password:
+        payload = api_json("POST", "/api/dev/login", retries=4,
+                           body={"email": email, "password": password})
+        token = str(payload.get("token") or payload.get("dev_token") or "")
+    return _reveal_keys_via_token(token) if token else []
+
+
+def _any_key_healthy(keys):
+    """并发 ping 一批 Key，只要有一把通过（未封禁）就算健康。判断静态 Key 是否整体失效用。"""
+    ok = {}
+
+    def _probe(kid, raw):
+        try:
+            payload = ping_server(raw)
+            auth = payload.get("auth") if isinstance(payload, dict) else {}
+            ok[kid] = not bool((auth or {}).get("banned"))
+        except RequestError:
+            ok[kid] = False
+
+    threads = [threading.Thread(target=_probe, args=(kid, raw), daemon=True)
+               for kid, raw in keys]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return any(ok.values())
+
+
+def resolve_keys(args):
+    """返回 [(key_id, raw_key)]。来源优先级：--keys > 环境 > 本地 secrets.env 静态 Key > dev 登录 reveal。
+
+    关键自愈：静态 Key 在手、但只要有 dev 凭据兜底，就先并发 ping 验活；整体失效就自动
+    dev 登录 reveal 新鲜 Key 顶上（覆盖“Key 还在但已过期”这一最常见情况）。两样元信息
+    记在 args 上供回写：
+      _keys_from_reveal —— 本次 Key 是不是 dev reveal 来的（决定要不要回写）；
+      _secrets_target   —— 新鲜 Key 回写到哪份 secrets 文件（保持“本地 secrets 为准”）。
     """
     args._keys_from_reveal = False
     args._secrets_target = None
@@ -409,42 +459,46 @@ def resolve_keys(args):
                 log("从 secrets 文件读到 %d 把 Key：%s" % (len(raw_keys), sf))
                 args._secrets_target = sf
                 break
+
     if raw_keys:
-        # 去重、生成稳定 key_id
         seen, out = set(), []
         for i, k in enumerate(raw_keys):
             if k in seen:
                 continue
             seen.add(k)
             out.append(("key%d-%s" % (i + 1, k[-4:]), k))
+        # 静态 Key 可能已过期；只要有 dev 凭据兜底，先验活、全死则自动换新鲜 Key（过期自愈）。
+        token, email, password, sf = _resolve_dev_creds(args)
+        if token or (email and password):
+            if _any_key_healthy(out):
+                return out
+            log("静态 Key 全部失效，改用 dev 凭据自动登录 reveal 新鲜 Key")
+            try:
+                revealed = _reveal_via_creds(token, email, password)
+            except RequestError as e:
+                log("dev 登录/reveal 失败（%s）；暂用原静态 Key 继续，由调度层重试/受阻侦测兜底" % e)
+                revealed = []
+            if revealed:
+                args._keys_from_reveal = True
+                if not args._secrets_target:
+                    args._secrets_target = sf
+                return revealed
+            log("dev reveal 未取到新鲜 Key，沿用原静态 Key（可能都已失效）")
         return out
 
-    # dev-token 流程（可选，复刻官方 hydrateKeys）。
-    # 凭据优先级：--dev-token / --email,--password > 环境变量 > secrets 文件。
-    # 这样只要把 dev 账号存成 Devin 密钥（环境变量）或写进 secrets.env，
-    # 即使不给静态 Key 也能每次自动登录 reveal 出一批“不会过期”的新 Key。
-    token = args.dev_token or os.environ.get("MATSCA_DEV_TOKEN")
-    email = args.email or os.environ.get("MATSCA_DEV_EMAIL")
-    password = args.password or os.environ.get("MATSCA_DEV_PASSWORD")
-    if not token and not (email and password):
-        for sf in _candidate_secrets_files(args.secrets_file):
-            creds = _read_dev_creds(sf)
-            if creds:
-                email = email or creds[0]
-                password = password or creds[1]
-                log("从 secrets 文件读到 dev 登录凭据：%s" % sf)
-                args._secrets_target = sf      # 新鲜 Key 默认回写到同一份本地 secrets
-                break
-    if not token and email and password:
-        payload = api_json("POST", "/api/dev/login",
-                           body={"email": email, "password": password})
-        token = str(payload.get("token") or payload.get("dev_token") or "")
-    if token:
-        revealed = _reveal_keys_via_token(token)
-        if revealed:
-            args._keys_from_reveal = True
-        return revealed
-    return []
+    # 没有任何静态 Key：纯靠 dev 登录 reveal。
+    token, email, password, sf = _resolve_dev_creds(args)
+    if sf:
+        log("从 secrets 文件读到 dev 登录凭据：%s" % sf)
+        args._secrets_target = sf
+    try:
+        revealed = _reveal_via_creds(token, email, password)
+    except RequestError as e:
+        log("dev 登录/reveal 失败：%s" % e)
+        revealed = []
+    if revealed:
+        args._keys_from_reveal = True
+    return revealed
 
 
 def save_keys_to_secrets(path, raw_keys):

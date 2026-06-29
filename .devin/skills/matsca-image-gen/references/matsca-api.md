@@ -14,7 +14,7 @@
 
 ## 0. 密钥来源与优先级
 
-脚本按此优先级解析 Key，命中即止：`--keys` > 环境变量 `MATSCA_API_KEYS`/`MATSCA_API_KEY` > `secrets.env` 里的 `MATSCA_API_KEYS=`（`--secrets-file` 指定或默认搜索）> dev 登录自动 reveal（`--dev-token` / `--email`+`--password` / 环境 `MATSCA_DEV_EMAIL`+`MATSCA_DEV_PASSWORD` / `secrets.env` 里同名凭据）。推荐把 Key 或 dev 凭据存成 Devin 环境密钥，免去每次取本机文件；dev 凭据方式每次自动登录 reveal 出新鲜不过期的 Key。
+以本机 `secrets.env`（`--secrets-file` 指定或默认搜索）为准：里面放 `MATSCA_API_KEYS=`（静态直连 Key）和 `MATSCA_DEV_EMAIL`/`MATSCA_DEV_PASSWORD`（dev 兜底凭据）。静态 Key 有效就直连；失效/缺失时用 dev 凭据自动登录 reveal 一批新鲜 Key，并**回写**这同一份 `secrets.env`（默认开，`--no-save-keys` 关、`--save-keys-file` 改目标），过期自愈、本地文件始终是最新真源。`--keys "k1,k2,k3"` 可临时直传裸 Key（最高优先）。`secrets.env` 始终被 `.gitignore` 排除、永不进仓。
 
 ## 1. 连接与鉴权
 
