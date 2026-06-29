@@ -387,7 +387,14 @@ def _candidate_secrets_files(explicit):
 
 
 def resolve_keys(args):
-    """返回 [(key_id, raw_key)]。优先 --keys，其次 secrets 文件/环境，最后 dev-token 流程。"""
+    """返回 [(key_id, raw_key)]。优先 --keys，其次 secrets 文件/环境，最后 dev-token 流程。
+
+    同时在 args 上记两样元信息供回写用：
+      _keys_from_reveal —— 本次 Key 是不是 dev 登录 reveal 来的（即静态 Key 已失效/缺失）；
+      _secrets_target   —— 该把新鲜 Key 回写到哪个 secrets 文件（保持“本地 secrets 为准”）。
+    """
+    args._keys_from_reveal = False
+    args._secrets_target = None
     raw_keys = []
     if args.keys:
         raw_keys = [k.strip() for k in args.keys.split(",") if k.strip()]
@@ -400,6 +407,7 @@ def resolve_keys(args):
             raw_keys = _read_secrets_file(sf)
             if raw_keys:
                 log("从 secrets 文件读到 %d 把 Key：%s" % (len(raw_keys), sf))
+                args._secrets_target = sf
                 break
     if raw_keys:
         # 去重、生成稳定 key_id
@@ -425,14 +433,48 @@ def resolve_keys(args):
                 email = email or creds[0]
                 password = password or creds[1]
                 log("从 secrets 文件读到 dev 登录凭据：%s" % sf)
+                args._secrets_target = sf      # 新鲜 Key 默认回写到同一份本地 secrets
                 break
     if not token and email and password:
         payload = api_json("POST", "/api/dev/login",
                            body={"email": email, "password": password})
         token = str(payload.get("token") or payload.get("dev_token") or "")
     if token:
-        return _reveal_keys_via_token(token)
+        revealed = _reveal_keys_via_token(token)
+        if revealed:
+            args._keys_from_reveal = True
+        return revealed
     return []
+
+
+def save_keys_to_secrets(path, raw_keys):
+    """把新鲜 Key 回写本地 secrets.env 的 MATSCA_API_KEYS 行（保留 dev 凭据/注释等其它行）。
+
+    设计意图：让“本地 secrets 仍是唯一真源”——静态 Key 过期后用 dev 登录补一批，
+    顺手回写，下次直接直连、不用再登录；文件本就被 .gitignore 排除、绝不进仓，私有不外泄。"""
+    line = "MATSCA_API_KEYS=" + ",".join(raw_keys)
+    kept, replaced = [], False
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            for raw in f.read().splitlines():
+                if raw.strip().split("=", 1)[0].strip() in ("MATSCA_API_KEYS", "MATSCA_API_KEY"):
+                    if not replaced:        # 用新行替掉首个 Key 行，其余 Key 行丢弃
+                        kept.append(line)
+                        replaced = True
+                    continue
+                kept.append(raw)
+    if not replaced:
+        kept.append("# 由 matsca-image-gen 自动回写（dev 登录 reveal 的新鲜 Key）")
+        kept.append(line)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(kept) + "\n")
+    try:
+        os.chmod(tmp, 0o600)                 # 尽量收紧权限（Windows 上无效，忽略）
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    log("已把 %d 把新鲜 Key 回写本地 secrets：%s" % (len(raw_keys), path))
 
 
 def _read_dev_creds(path):
@@ -1187,6 +1229,10 @@ def main():
     ap.add_argument("--dev-token", dest="dev_token", default=None, help="dev token（自动列 Key + reveal）")
     ap.add_argument("--email", default=None, help="dev 账号（配合 --password 登录拿 token）")
     ap.add_argument("--password", default=None, help="dev 密码")
+    ap.add_argument("--no-save-keys", dest="save_keys", action="store_false", default=True,
+                    help="默认：dev 登录 reveal 到新鲜 Key 后回写本地 secrets.env（过期自愈）；加此项关闭回写")
+    ap.add_argument("--save-keys-file", dest="save_keys_file", default=None,
+                    help="指定回写 secrets 的路径（默认回写到读凭据/Key 的那份本地 secrets）")
     # 健康检查
     ap.add_argument("--preflight-ping", dest="preflight_ping", action="store_true",
                     help="生成前对每把 Key ping 一次（GET /v1/ping，官方支持，安全）")
@@ -1201,6 +1247,15 @@ def main():
     if not keys:
         sys.exit("没有可用 Key：用 --keys / --secrets-file / 环境变量 MATSCA_API_KEY(S) / --dev-token")
     log("可用 Key：%d 把（%s）" % (len(keys), ", ".join(kid for kid, _ in keys)))
+
+    # 静态 Key 失效后用 dev 登录补的新鲜 Key 顺手回写本地 secrets，保持“本地为准”、过期自愈。
+    if args.save_keys and getattr(args, "_keys_from_reveal", False):
+        target = args.save_keys_file or getattr(args, "_secrets_target", None)
+        if target:
+            try:
+                save_keys_to_secrets(target, [raw for _, raw in keys])
+            except OSError as e:
+                log("回写 secrets 失败（忽略，不影响本次生成）：%s" % e)
 
     if args.ping_only:
         out = {}

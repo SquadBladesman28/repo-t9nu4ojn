@@ -49,12 +49,21 @@ python scripts/gen_image.py --ping-only
 
 所有 Key 按直连处理，不分模式；多把自动开健康调度 + 故障转移。
 
-推荐做法（省去每次经隧道取本机文件）：把密钥存成 **Devin 环境密钥**，会话自动注入为环境变量，脚本零隧道零文件即可读到。二选一：
+### 本地 secrets.env 为准 + 过期自愈（推荐）
 
-- 存 `MATSCA_API_KEYS`（命 2）——最直接，但静态 Key 会过期，需自己更新；
-- 存 dev 账号 `MATSCA_DEV_EMAIL` + `MATSCA_DEV_PASSWORD`（命 4）——脚本每次自动登录 reveal 一批**新鲜不过期**的 Key，一次设置长期可用，最省心。
+以本机 `secrets.env`（如 `D:\700_Resources\720_Agents\secrets.env`）为唯一真源，里面同时放两样、用 `--secrets-file` 指向它：
 
-本机 `secrets.env`（如 `D:\700_Resources\720_Agents\secrets.env`）仍作兜底：里面放 `MATSCA_API_KEYS=` 和/或 `MATSCA_DEV_EMAIL/PASSWORD=` 即可，用 `--secrets-file` 指向它。
+```
+MATSCA_API_KEYS=key1,key2,key3        # 静态直连 Key（会过期）
+MATSCA_DEV_EMAIL=you@example.com      # dev 账号——静态 Key 失效时的兜底
+MATSCA_DEV_PASSWORD=******
+```
+
+静态 Key 还有效就直连（命 3）；一旦失效/缺失，脚本用 dev 凭据自动登录 reveal 一批新鲜 Key（命 4），**并把新 Key 回写这同一份 `secrets.env`**（只换 `MATSCA_API_KEYS=` 一行，dev 凭据与注释原样保留）。于是下次直接直连、不必再登录，过期了又自动补——本地文件始终是最新真源，不用手动更新 Key、也不用搞环境变量。
+
+- 回写默认开；`--no-save-keys` 关掉，`--save-keys-file <路径>` 改回写目标。
+- `secrets.env` 始终被 `.gitignore` 排除、永不进仓，私有不外泄。
+- 经隧道在云端用时：Devin 跑通后同理把新鲜 Key 写回你本机的 `secrets.env`。
 
 ## 结果判定：以 manifest.json 为准
 
@@ -104,7 +113,7 @@ python scripts/gen_image.py --ping-only
 - 一把 Key 反复 401/失效：先 `--ping-only` 看是不是 `banned`；是封禁就等 `ban_remaining_seconds`，是 `account_token_invalid` 就换 Key。
 - 持续 429 / 池满：多给几把 Key 比调高并发管用，工具会自动冷却拥堵的 Key、把流量挪开。
 - `content_policy_violation`：内容违规，改提示词，别重试——重试只会累加风控、可能扣费且不退。
-- 静态 Key 全部 401 / 过期：要么更新 `MATSCA_API_KEYS`，要么改用 dev 凭据让脚本每次自动 reveal 新鲜 Key（见「密钥来源」命 4）——后者一劳永逸。
+- 静态 Key 全部 401 / 过期：只要 `secrets.env` 里还有 dev 凭据，脚本会自动登录 reveal 新鲜 Key 并回写该文件（见「本地 secrets.env 为准 + 过期自愈」），无需手动更新；想关掉回写用 `--no-save-keys`。
 - `--mask` 必须配合 `--edit`：蒙版只在改图 `/v1/images/edits` 时生效；只给 `--mask` 不给 `--edit` 会直接报错（而非静默走普通生图）。
 - 需要查钱包 / 换 Key / reveal 明文：走开发者登录（`/api/dev/*`）——凭据即「密钥来源」命 4 的 `MATSCA_DEV_*`，可手动 `--email`+`--password` 传入，脚本在没有静态 Key 时也会自动用它。
 

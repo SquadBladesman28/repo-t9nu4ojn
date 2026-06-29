@@ -530,6 +530,31 @@ def test_initial_manifest_written_before_first_event():
     print("PASS test_initial_manifest_written_before_first_event")
 
 
+def test_save_keys_to_secrets_roundtrip():
+    """密钥回写：替换/新增 MATSCA_API_KEYS 行，保留 dev 凭据等其它行。"""
+    import tempfile as _t
+    p = os.path.join(_t.mkdtemp(), "secrets.env")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("# 注释\nMATSCA_DEV_EMAIL=a@b.com\nMATSCA_API_KEYS=old1,old2\nMATSCA_DEV_PASSWORD=pw\n")
+    G.save_keys_to_secrets(p, ["new1", "new2", "new3"])
+    body = open(p, encoding="utf-8").read()
+    # 旧 Key 行被替换、dev 凭据与注释保留、只剩一行 MATSCA_API_KEYS
+    assert "MATSCA_API_KEYS=new1,new2,new3" in body, body
+    assert "old1" not in body, body
+    assert "MATSCA_DEV_EMAIL=a@b.com" in body and "MATSCA_DEV_PASSWORD=pw" in body, body
+    assert "# 注释" in body, body
+    assert body.count("MATSCA_API_KEYS=") == 1, body
+    # 回读校验：脚本能从回写后的文件读回新 Key
+    assert G._read_secrets_file(p) == ["new1", "new2", "new3"], G._read_secrets_file(p)
+    # 文件没有 Key 行时应追加
+    p2 = os.path.join(_t.mkdtemp(), "s2.env")
+    with open(p2, "w", encoding="utf-8") as f:
+        f.write("MATSCA_DEV_EMAIL=x@y.com\n")
+    G.save_keys_to_secrets(p2, ["k1"])
+    assert "MATSCA_API_KEYS=k1" in open(p2, encoding="utf-8").read()
+    print("PASS test_save_keys_to_secrets_roundtrip")
+
+
 if __name__ == "__main__":
     test_concurrency_caps()
     test_single_call_n()
@@ -557,4 +582,5 @@ if __name__ == "__main__":
     test_n_out_of_range_clamped()
     test_parse_json_html_truncated()
     test_initial_manifest_written_before_first_event()
+    test_save_keys_to_secrets_roundtrip()
     print("\nALL OFFLINE TESTS PASSED")
