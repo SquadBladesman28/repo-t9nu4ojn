@@ -18,11 +18,11 @@ description: 通过 https://img.matsca.com（矩岩 Matsca）上的 OpenAI 兼�
 ## 快速开始
 
 ```bash
-# 单张：直接传裸 Key（逗号分隔，多把即自动开启健康调度+故障转移）
-python scripts/gen_image.py "一只戴贝雷帽的橘猫，扁平插画风" --keys "k1,k2,k3"
+# 单张：Key 走环境变量（推荐，见「密钥来源」），脚本零配置自动读
+python scripts/gen_image.py "一只戴贝雷帽的橘猫，扁平插画风"
 
-# 用本机密钥文件（经隧道到用户本机取用）：--secrets-file 指向它
-python scripts/gen_image.py "赛博朋克城市夜景" --secrets-file "D:\700_Resources\720_Agents\secrets.env"
+# 也可临时直接传裸 Key（逗号分隔，多把即自动开启健康调度+故障转移）
+python scripts/gen_image.py "赛博朋克城市夜景" --keys "k1,k2,k3"
 
 # 批量：每行一个 prompt，或一个 JSON 列表（每项可带 name/n/size/edit/variation/mask…）
 python scripts/gen_image.py --prompts-file prompts.txt --outdir output/fig
@@ -40,10 +40,21 @@ python scripts/gen_image.py --ping-only
 
 ## 密钥来源
 
-密钥存放在本机 `D:\700_Resources\720_Agents\secrets.env`：
+脚本按这个优先级找 Key，命中即止：
 
-- 生图密钥 `MATSCA_API_KEYS=key1,key2,key3`（逗号分隔，多把即自动开调度），运行时用 `--secrets-file` 指向该文件即可，也可直接 `--keys "k1,k2,k3"` 临时传入。所有 Key 按直连处理，不分模式。
-- 开发者账号（邮箱 `MATSCA_DEV_EMAIL` +密码 `MATSCA_DEV_PASSWORD`），仅账号自检时手动取用——见「故障排查」。
+1. `--keys "k1,k2,k3"`（临时显式传入）
+2. 环境变量 `MATSCA_API_KEYS` / `MATSCA_API_KEY`（逗号分隔）
+3. `--secrets-file` 指定的 / 默认搜索到的 `secrets.env` 里的 `MATSCA_API_KEYS=`
+4. dev 登录自动 reveal：`--dev-token` 或 `--email`+`--password`，或环境 `MATSCA_DEV_EMAIL`+`MATSCA_DEV_PASSWORD`，或 `secrets.env` 里的同名凭据——脚本会自动登录、列 Key、reveal 出明文 Key
+
+所有 Key 按直连处理，不分模式；多把自动开健康调度 + 故障转移。
+
+推荐做法（省去每次经隧道取本机文件）：把密钥存成 **Devin 环境密钥**，会话自动注入为环境变量，脚本零隧道零文件即可读到。二选一：
+
+- 存 `MATSCA_API_KEYS`（命 2）——最直接，但静态 Key 会过期，需自己更新；
+- 存 dev 账号 `MATSCA_DEV_EMAIL` + `MATSCA_DEV_PASSWORD`（命 4）——脚本每次自动登录 reveal 一批**新鲜不过期**的 Key，一次设置长期可用，最省心。
+
+本机 `secrets.env`（如 `D:\700_Resources\720_Agents\secrets.env`）仍作兜底：里面放 `MATSCA_API_KEYS=` 和/或 `MATSCA_DEV_EMAIL/PASSWORD=` 即可，用 `--secrets-file` 指向它。
 
 ## 结果判定：以 manifest.json 为准
 
@@ -53,7 +64,8 @@ python scripts/gen_image.py --ping-only
 - `errors[]` = 已确定失败（带 `error` 文案和 `key_id`）。
 - `pending[]` = 还没跑完——别把它当失败，工具还在重试。
 - `ok` 仅当 `errors` 和 `pending` 都为空才为 `true`。
-- 退出码同样表态：`0`=全成、`3`=部分成功、`4`=一张都没出。
+- 退出码同样表态：`0`=全成、`3`=部分成功、`4`=一张都没出（`--ping-only` 模式下 `4`=没有一把 Key 通过健康检查）。
+- manifest 在任务一启动就先落一份全 `pending` 的（首个请求可能要等几十秒~10min），所以从 0s 起就能读到结构化状态，不会出现「文件还不存在」。
 
 字段全集（含受阻字段）见 `references/matsca-api.md`。
 
@@ -92,7 +104,9 @@ python scripts/gen_image.py --ping-only
 - 一把 Key 反复 401/失效：先 `--ping-only` 看是不是 `banned`；是封禁就等 `ban_remaining_seconds`，是 `account_token_invalid` 就换 Key。
 - 持续 429 / 池满：多给几把 Key 比调高并发管用，工具会自动冷却拥堵的 Key、把流量挪开。
 - `content_policy_violation`：内容违规，改提示词，别重试——重试只会累加风控、可能扣费且不退。
-- 需要查钱包 / 换 Key / reveal 明文：正常生图用不到登录；只有账号自检（`/api/dev/*`）才走开发者登录——凭据就在「密钥」所述的同一 `secrets.env`（仅备忘、脚本不读），手动用 `--email`+`--password` 传入。
+- 静态 Key 全部 401 / 过期：要么更新 `MATSCA_API_KEYS`，要么改用 dev 凭据让脚本每次自动 reveal 新鲜 Key（见「密钥来源」命 4）——后者一劳永逸。
+- `--mask` 必须配合 `--edit`：蒙版只在改图 `/v1/images/edits` 时生效；只给 `--mask` 不给 `--edit` 会直接报错（而非静默走普通生图）。
+- 需要查钱包 / 换 Key / reveal 明文：走开发者登录（`/api/dev/*`）——凭据即「密钥来源」命 4 的 `MATSCA_DEV_*`，可手动 `--email`+`--password` 传入，脚本在没有静态 Key 时也会自动用它。
 
 ## 延伸参考
 

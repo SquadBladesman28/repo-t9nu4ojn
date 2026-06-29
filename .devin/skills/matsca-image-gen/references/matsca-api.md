@@ -3,6 +3,7 @@
 纯事实速查：端点、参数、字段、错误码、阈值、常量。配 `../SKILL.md`（怎么用）和 `matsca-image-gen-notes.md`（为什么）一起看。
 
 ## 目录
+0. 密钥来源与优先级
 1. 连接与鉴权
 2. 端点
 3. 请求参数
@@ -10,6 +11,10 @@
 5. manifest.json schema 与退出码
 6. 错误码与可重试性
 7. 并发 / 重试 / 冷却常量
+
+## 0. 密钥来源与优先级
+
+脚本按此优先级解析 Key，命中即止：`--keys` > 环境变量 `MATSCA_API_KEYS`/`MATSCA_API_KEY` > `secrets.env` 里的 `MATSCA_API_KEYS=`（`--secrets-file` 指定或默认搜索）> dev 登录自动 reveal（`--dev-token` / `--email`+`--password` / 环境 `MATSCA_DEV_EMAIL`+`MATSCA_DEV_PASSWORD` / `secrets.env` 里同名凭据）。推荐把 Key 或 dev 凭据存成 Devin 环境密钥，免去每次取本机文件；dev 凭据方式每次自动登录 reveal 出新鲜不过期的 Key。
 
 ## 1. 连接与鉴权
 
@@ -96,7 +101,9 @@
 - **受阻字段**：`blocked` / `block_reason`（`502_storm` / `429_congestion` / `key_banned`）/ `blocked_since` / `no_progress_seconds` / `gave_up`，随增量快照刷新。轮询见 `blocked:true` 即非阻塞提醒用户。
 - `--resume`：重跑同一 `outdir` 时，按 `name` 命中且文件仍在的已成功内容会被跳过。
 
-**退出码**：`0`=全部成功；`3`=部分成功（有 `errors[]`，含 `--give-up-after` 熔断收尾）；`4`=一张都没出。
+**退出码**：`0`=全部成功；`3`=部分成功（有 `errors[]`，含 `--give-up-after` 熔断收尾）；`4`=一张都没出。`--ping-only` 模式下 `0`=至少一把 Key 通过，`4`=全部 Key ping 失败（脚本化健康检查可据此判定）。
+
+- 任务**一启动**就先写一份全 `pending` 的初始 manifest（首个请求可能耗时几十秒~10min），轮询方从 0s 起即可读到结构化状态，不会撞上「文件不存在」。
 
 ## 6. 错误码与可重试性
 

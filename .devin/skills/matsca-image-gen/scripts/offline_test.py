@@ -446,6 +446,90 @@ def test_blocked_ping_distinguishes_ban():
     print("PASS test_blocked_ping_distinguishes_ban")
 
 
+# ── Phase 4 健壮性修复回归 ─────────────────────────────────────────────────────
+def test_missing_prompts_file_clean_exit():
+    """H1：--prompts-file 指向不存在文件 → 干净 sys.exit，不再抛 traceback。"""
+    try:
+        G._load_prompts_file("/definitely/nope/not-here.txt")
+        assert False, "应当 sys.exit"
+    except SystemExit as e:
+        assert "无法读取" in str(e), e
+    print("PASS test_missing_prompts_file_clean_exit")
+
+
+def test_dedupe_duplicate_names():
+    """H2：批次内重名 → 自动改唯一名，避免输出互相覆盖。"""
+    tasks = [G.Task(1, "同名", "p", 1, "auto", "m"),
+             G.Task(2, "同名", "p", 1, "auto", "m"),
+             G.Task(3, "同名", "p", 1, "auto", "m")]
+    G._dedupe_names(tasks)
+    names = [t.name for t in tasks]
+    assert len(set(names)) == 3, names
+    assert names[0] == "同名" and names[1] == "同名-2" and names[2] == "同名-3", names
+    print("PASS test_dedupe_duplicate_names -> %s" % names)
+
+
+def test_mask_without_edit_errors():
+    """M2：给了 mask 却没 edit → 明确报错，不再静默走普通生图。"""
+    tasks = [G.Task(1, "m", "p", 1, "auto", "m", mask_path="/tmp/x.png")]
+    try:
+        G._validate_tasks(tasks)
+        assert False, "应当 sys.exit"
+    except SystemExit as e:
+        assert "--mask" in str(e) and "--edit" in str(e), e
+    print("PASS test_mask_without_edit_errors")
+
+
+def test_n_out_of_range_clamped():
+    """L1：n 越界仍钳制到 1~4（并打提示）。"""
+    assert G.Task(1, "a", "p", 0, "auto", "m").n == 1
+    assert G.Task(1, "a", "p", 99, "auto", "m").n == 4
+    print("PASS test_n_out_of_range_clamped")
+
+
+def test_parse_json_html_truncated():
+    """L2：非 JSON（HTML 502 页）→ 收敛成一行短文案，不刷屏。"""
+    html = (b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n"
+            b"<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n"
+            b"<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n")
+    msg = G._parse_json(html).get("message", "")
+    assert "<" not in msg and "\n" not in msg, msg
+    assert "502 Bad Gateway" in msg, msg
+    assert len(msg) <= 201, len(msg)
+    print("PASS test_parse_json_html_truncated -> %r" % msg)
+
+
+def test_initial_manifest_written_before_first_event():
+    """H3：启动即写初始 pending manifest（首个请求返回前轮询方就能读到）。"""
+    import json as _json
+    seen = {"existed": None}
+
+    def fake_gen(key, payload, timeout=600):
+        mpath = os.path.join(seen["outdir"], "manifest.json")
+        # 第一个生图调用发生时，初始 manifest 必须已存在
+        if seen["existed"] is None:
+            seen["existed"] = os.path.exists(mpath)
+            if seen["existed"]:
+                d = _json.load(open(mpath, encoding="utf-8"))
+                seen["pending"] = d.get("pending_count")
+        return _ok_payload(1)
+
+    orig = G.generate_image
+    G.generate_image = fake_gen
+    try:
+        khs = [G.KeyHealth("kA", "rawA")]
+        outdir = tempfile.mkdtemp()
+        seen["outdir"] = outdir
+        tasks = [G.Task(1, "init", "p", 1, "auto", "m")]
+        s = G.Scheduler(tasks, khs, outdir, timeout=5)
+        s.run()
+        assert seen["existed"] is True, "首个请求前应已写初始 manifest"
+        assert seen["pending"] == 1, seen
+    finally:
+        G.generate_image = orig
+    print("PASS test_initial_manifest_written_before_first_event")
+
+
 if __name__ == "__main__":
     test_concurrency_caps()
     test_single_call_n()
@@ -466,4 +550,11 @@ if __name__ == "__main__":
     # Phase 3
     test_blocked_detection_and_giveup()
     test_blocked_ping_distinguishes_ban()
+    # Phase 4 健壮性修复回归
+    test_missing_prompts_file_clean_exit()
+    test_dedupe_duplicate_names()
+    test_mask_without_edit_errors()
+    test_n_out_of_range_clamped()
+    test_parse_json_html_truncated()
+    test_initial_manifest_written_before_first_event()
     print("\nALL OFFLINE TESTS PASSED")

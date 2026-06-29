@@ -221,7 +221,14 @@ def _parse_json(raw):
     try:
         return json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
-        return {"message": raw.decode("utf-8", "replace")}
+        # 非 JSON（如网关返回的整页 HTML 错误页）：收敛成一行短文案。
+        # 否则错误信息里会塞进整段 <html>…502 Bad Gateway…</html>，逐 Key 刷屏污染日志。
+        text = raw.decode("utf-8", "replace")
+        text = re.sub(r"<[^>]+>", " ", text)        # 去 HTML 标签
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > 200:
+            text = text[:200] + "…"
+        return {"message": text or "非 JSON 响应"}
 
 
 def api_json(method, path, key=None, body=None, timeout=None, retries=2,
@@ -404,15 +411,49 @@ def resolve_keys(args):
             out.append(("key%d-%s" % (i + 1, k[-4:]), k))
         return out
 
-    # dev-token 流程（可选，复刻官方 hydrateKeys）
+    # dev-token 流程（可选，复刻官方 hydrateKeys）。
+    # 凭据优先级：--dev-token / --email,--password > 环境变量 > secrets 文件。
+    # 这样只要把 dev 账号存成 Devin 密钥（环境变量）或写进 secrets.env，
+    # 即使不给静态 Key 也能每次自动登录 reveal 出一批“不会过期”的新 Key。
     token = args.dev_token or os.environ.get("MATSCA_DEV_TOKEN")
-    if not token and args.email and args.password:
+    email = args.email or os.environ.get("MATSCA_DEV_EMAIL")
+    password = args.password or os.environ.get("MATSCA_DEV_PASSWORD")
+    if not token and not (email and password):
+        for sf in _candidate_secrets_files(args.secrets_file):
+            creds = _read_dev_creds(sf)
+            if creds:
+                email = email or creds[0]
+                password = password or creds[1]
+                log("从 secrets 文件读到 dev 登录凭据：%s" % sf)
+                break
+    if not token and email and password:
         payload = api_json("POST", "/api/dev/login",
-                           body={"email": args.email, "password": args.password})
+                           body={"email": email, "password": password})
         token = str(payload.get("token") or payload.get("dev_token") or "")
     if token:
         return _reveal_keys_via_token(token)
     return []
+
+
+def _read_dev_creds(path):
+    """从 secrets.env 读 MATSCA_DEV_EMAIL / MATSCA_DEV_PASSWORD（静态 Key 都没时的凭据兜底）。"""
+    email = pw = ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"')
+                if k == "MATSCA_DEV_EMAIL":
+                    email = v
+                elif k == "MATSCA_DEV_PASSWORD":
+                    pw = v
+    except OSError:
+        return None
+    return (email, pw) if email and pw else None
 
 
 def _reveal_keys_via_token(token):
@@ -451,7 +492,10 @@ class Task:
         self.index = index
         self.name = name
         self.prompt = prompt
-        self.n = max(1, min(4, int(n)))
+        raw_n = int(n)
+        self.n = max(1, min(4, raw_n))
+        if raw_n != self.n:
+            log("注意 [%s]：每内容数量 n=%d 越界，已钳制到 %d（有效范围 1~4）" % (name, raw_n, self.n))
         self.need = self.n               # 该内容想要的总图数（赛马/覆盖优先按它派单）
         self.size = size
         self.model = model
@@ -590,6 +634,12 @@ class Scheduler:
     # —— 主循环 —— #
     def run(self):
         os.makedirs(self.outdir, exist_ok=True)
+        # 启动即落一份全 pending 的 manifest：首个请求可能耗时几十秒~10min，
+        # 轮询方应当从 0s 起就能读到结构化状态，而不是“文件不存在”（与 SKILL「只读 manifest 判进展」一致）。
+        try:
+            write_manifest(self.outdir, self.tasks, self._block_status())
+        except OSError as e:
+            log("写初始 manifest 失败（忽略）：%s" % e)
         if self.preflight_ping:
             self._preflight()
         while True:
@@ -776,18 +826,28 @@ class Scheduler:
             return self._block_status_locked()
 
     def _any_key_banned(self):
-        """受阻时 ping 各 Key，任一返回 banned 即 True（区分‘被封’ vs ‘上游容量’）。"""
-        for kid, kh in self.keys.items():
+        """受阻时并发 ping 各 Key，任一返回 banned 即 True（区分‘被封’ vs ‘上游容量’）。
+        并发而非串行：storm 下每把 Key 都可能等满 ping 超时，串行会把侦测拖慢到 N×超时。"""
+        banned = {}
+
+        def _probe(kid, kh):
             try:
                 payload = ping_server(kh.raw)
                 auth = payload.get("auth") if isinstance(payload, dict) else None
                 if isinstance(auth, dict) and auth.get("banned"):
                     log("受阻 ping：Key %s 处于封禁（ban_remaining≈%ss）" % (
                         kid, int(auth.get("ban_remaining_seconds") or 0)))
-                    return True
+                    banned[kid] = True
             except RequestError as e:
                 log("受阻 ping 失败 key=%s: %s（忽略）" % (kid, e))
-        return False
+
+        threads = [threading.Thread(target=_probe, args=(kid, kh), daemon=True)
+                   for kid, kh in self.keys.items()]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return any(banned.values())
 
     def _check_blocked(self):
         """池级受阻判定：持续零进展 + (最近失败多为容量类 或 所有 Key 都在冷却)。"""
@@ -947,8 +1007,11 @@ def _params_from_spec(spec):
 
 
 def _load_prompts_file(path):
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        sys.exit("批量文件无法读取：%s（%s）" % (path, e))
     specs = []
     try:
         parsed = json.loads(text)
@@ -993,6 +1056,33 @@ def build_tasks(args):
             edit_path=args.edit, mask_path=args.mask, var_path=args.variation,
             params=base_params,
         ))
+    _validate_tasks(tasks)
+    return _dedupe_names(tasks)
+
+
+def _validate_tasks(tasks):
+    """下发前做一次预检，把“静默走错分支”提前变成明确报错。"""
+    for t in tasks:
+        # 蒙版只在改图 /v1/images/edits 生效；给了 mask 却没 edit 会被静默忽略，走成普通生图。
+        if t.mask_path and not t.edit_path:
+            sys.exit("--mask 需要配合 --edit 使用（蒙版只在改图 /v1/images/edits 时生效）；内容 '%s' 给了 mask 但没有 edit。" % t.name)
+
+
+def _dedupe_names(tasks):
+    """同名任务会落到同一文件名互相覆盖，且 manifest 都记成功、--resume 还会误跳——
+    批次内把重名改唯一，并提醒用户。"""
+    used = set()
+    for t in tasks:
+        if t.name not in used:
+            used.add(t.name)
+            continue
+        i = 2
+        while "%s-%d" % (t.name, i) in used:
+            i += 1
+        new = "%s-%d" % (t.name, i)
+        log("注意：重名内容 '%s' 自动改名为 '%s'（避免输出互相覆盖）" % (t.name, new))
+        t.name = new
+        used.add(new)
     return tasks
 
 
@@ -1123,6 +1213,9 @@ def main():
             except RequestError as e:
                 out[kid] = {"ok": False, "status": e.status, "code": e.code, "error": str(e)}
         print(json.dumps(out, ensure_ascii=False, indent=2))
+        # 全部 Key 都 ping 不通时返回非零退出码，让脚本化调用能靠退出码判健康检查成败。
+        if not any(v.get("ok") for v in out.values()):
+            sys.exit(4)
         return
 
     tasks = build_tasks(args)
