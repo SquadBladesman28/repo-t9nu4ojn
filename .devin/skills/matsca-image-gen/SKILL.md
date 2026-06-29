@@ -87,12 +87,12 @@ MATSCA_DEV_PASSWORD=******
 
 ## 可选开关
 
-以下开关均默认关闭，显式开启才生效。默认行为已经够用，这些是给特定场景的；不确定就别开。详细取舍见 `references/matsca-image-gen-notes.md`。
+**赛马 `--race` 与覆盖优先 `--coverage-first` 默认常开**（早交付、多内容先各凑一张）；其余开关默认关闭、显式开启才生效。详细取舍见 `references/matsca-image-gen-notes.md`。
 
 | 开关 | 什么时候用 |
 |---|---|
-| `--race` | 想"先看到一张"：把每内容拆成多个 `n=1` 并发，先到的当主图。代价是更易打满单 Key、更易撞限流。 |
-| `--coverage-first` | 多主题批量时先给每种各出一张铺版，再回头补备份。 |
+| `--no-race` | 关掉赛马（默认开）。赛马把每内容拆成多个 `n=1` 并发、先到的当主图，早交付；多内容/多 Key 时想退回每内容单请求 `n=N` 一次拿齐就加这个。 |
+| `--no-coverage-first` | 关掉覆盖优先（默认开）。覆盖优先在多内容时先给每种各出一张铺版再补备份；想严格按内容顺序、一个补满再下一个就加这个。 |
 | `--variation <img>` / `--edit <img>` `--mask <img>` | 图生图变体 / 改图 / 蒙版局部重绘。 |
 | `--quality/--moderation/--background/--style/--output-format/--output-compression/--input-fidelity` | 需要把这些参数透传给服务端时（默认一个都不发）。 |
 | `--aspect 16:9` | `size=auto` 时把画面比例写进提示词。 |

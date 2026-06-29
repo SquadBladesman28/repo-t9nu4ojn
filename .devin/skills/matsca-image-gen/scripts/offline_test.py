@@ -599,6 +599,40 @@ def test_healthy_static_keys_no_reveal():
     print("PASS test_healthy_static_keys_no_reveal")
 
 
+def test_default_race_and_coverage_on():
+    """CLI 默认：赛马 + 覆盖优先常开；--no-* 才关。"""
+    ap = G.build_parser()
+    a = ap.parse_args(["猫"])
+    assert a.race is True and a.coverage_first is True, (a.race, a.coverage_first)
+    a2 = ap.parse_args(["猫", "--no-race", "--no-coverage-first"])
+    assert a2.race is False and a2.coverage_first is False, (a2.race, a2.coverage_first)
+    print("PASS test_default_race_and_coverage_on")
+
+
+def test_manifest_live_partial_progress():
+    """中途 manifest 反映部分进展：running 内容的部分图计入 saved_images，
+    pending 项带 n_got/saved，轮询方不再卡在 all-pending。"""
+    outdir = tempfile.mkdtemp()
+    t_done = G.Task(1, "甲", "p1", 2, "auto", "m")
+    t_done.status = "completed"
+    t_done.results = [{"path": "/x/a.png", "role": "primary"},
+                      {"path": "/x/a2.png", "role": "backup"}]
+    t_part = G.Task(2, "乙", "p2", 2, "auto", "m")
+    t_part.status = "running"
+    t_part.results = [{"path": "/x/b.png", "role": "primary"}]   # 2 张里已落 1
+    t_wait = G.Task(3, "丙", "p3", 1, "auto", "m")
+    t_wait.status = "waiting"
+    path, m = G.write_manifest(outdir, [t_done, t_part, t_wait])
+    # 已落盘总张数 = 2 + 1 + 0 = 3（含未跑完内容的部分图）
+    assert m["saved_images"] == 3, m["saved_images"]
+    assert m["completed"] == 1 and m["pending_count"] == 2, m
+    pend = {p["name"]: p for p in m["pending"]}
+    assert pend["乙"]["n_got"] == 1 and pend["乙"]["n_requested"] == 2, pend["乙"]
+    assert pend["乙"]["saved"] and pend["丙"]["n_got"] == 0, pend
+    assert m["ok"] is False
+    print("PASS test_manifest_live_partial_progress")
+
+
 if __name__ == "__main__":
     test_concurrency_caps()
     test_single_call_n()
@@ -629,4 +663,7 @@ if __name__ == "__main__":
     test_save_keys_to_secrets_roundtrip()
     test_stale_static_keys_self_heal()
     test_healthy_static_keys_no_reveal()
+    # Phase 5 默认常开 + manifest 实时部分进展
+    test_default_race_and_coverage_on()
+    test_manifest_live_partial_progress()
     print("\nALL OFFLINE TESTS PASSED")

@@ -449,10 +449,6 @@ def resolve_keys(args):
     if args.keys:
         raw_keys = [k.strip() for k in args.keys.split(",") if k.strip()]
     if not raw_keys:
-        for env in ("MATSCA_API_KEYS", "MATSCA_API_KEY"):
-            if os.environ.get(env):
-                raw_keys += [k.strip() for k in os.environ[env].split(",") if k.strip()]
-    if not raw_keys:
         for sf in _candidate_secrets_files(args.secrets_file):
             raw_keys = _read_secrets_file(sf)
             if raw_keys:
@@ -738,6 +734,7 @@ class Scheduler:
             log("写初始 manifest 失败（忽略）：%s" % e)
         if self.preflight_ping:
             self._preflight()
+        last_snapshot = None
         while True:
             with self.lock:
                 self._dispatch_locked()
@@ -752,8 +749,13 @@ class Scheduler:
             try:
                 ev = self.events.get(timeout=SCHEDULER_TICK_S)
             except queue.Empty:
+                self._refresh_manifest(last_snapshot)
+                last_snapshot = self._progress_snapshot()
                 continue
             self._handle_event(ev)
+            # 出图/失败/受阻变化后刷新 manifest，让轮询方实时看到部分进展（不再卡在初始 all-pending）
+            self._refresh_manifest(last_snapshot)
+            last_snapshot = self._progress_snapshot()
 
     def _preflight(self):
         for kid, kh in self.keys.items():
@@ -920,6 +922,21 @@ class Scheduler:
     def _block_status(self):
         with self.lock:
             return self._block_status_locked()
+
+    def _progress_snapshot(self):
+        """轻量指纹：图数/状态/受阻态有变才重写 manifest，避免空转刷盘。"""
+        with self.lock:
+            tasks = tuple((t.got, t.status, t.retry_count) for t in self.tasks)
+        return (tasks, self.blocked, self.gave_up)
+
+    def _refresh_manifest(self, last_snapshot):
+        """中途快照：进展有变就把当前状态写进 manifest，轮询方实时可见。"""
+        if self._progress_snapshot() == last_snapshot:
+            return
+        try:
+            write_manifest(self.outdir, self.tasks, self._block_status())
+        except OSError as e:
+            log("刷新 manifest 失败（忽略）：%s" % e)
 
     def _any_key_banned(self):
         """受阻时并发 ping 各 Key，任一返回 banned 即 True（区分‘被封’ vs ‘上游容量’）。
@@ -1193,13 +1210,16 @@ def write_manifest(outdir, tasks, extra=None):
         elif t.status == "failed":
             errors.append({"name": t.name, "index": t.index, "prompt": t.prompt,
                            "error": t.error or "无图片返回", "key_id": t.key_id})
-        else:  # waiting / running —— 尚未跑完，别误记成失败（中途快照会读到）
+        else:  # waiting / running —— 尚未跑完，别误记成失败；带上已落盘的部分进度供轮询读
             pending.append({"name": t.name, "index": t.index, "prompt": t.prompt,
-                            "status": t.status, "retry_count": t.retry_count})
+                            "status": t.status, "retry_count": t.retry_count,
+                            "n_requested": t.n, "n_got": len(t.results),
+                            "saved": list(t.results)})
     manifest = {"created_at": _utc_ts(), "results": results, "errors": errors,
                 "pending": pending,
                 "ok": not errors and not pending,
-                "saved_images": sum(len(t.results) for t in tasks if t.status == "completed"),
+                # 已落盘总张数（含未跑完内容的部分图），反映“现在手上有几张”，供轮询看真实进展
+                "saved_images": sum(len(t.results) for t in tasks),
                 "completed": len(results), "failed": len(errors), "pending_count": len(pending)}
     if extra:
         manifest.update(extra)
@@ -1234,7 +1254,7 @@ def _resume_completed(outdir, tasks):
     return n
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description="matsca 生图 CLI（官方插件策略无头移植版）")
     ap.add_argument("prompt", nargs="?", default=None, help="提示词（单内容）")
     ap.add_argument("--prompts-file", dest="prompts_file", default=None,
@@ -1250,11 +1270,11 @@ def main():
     ap.add_argument("--variation", default=None, help="图生图/变体：原图路径，走 /v1/images/variations（可无 prompt）")
     ap.add_argument("--timeout", type=int, default=IMAGE_TIMEOUT_S, help="单请求墙钟上限（秒，默认 600）")
     ap.add_argument("--proxy", default=None, help="下载 url 图片用的代理（可选，仅 url 模式用得上）")
-    # 赛马 / 覆盖优先（D/E）——默认关，保持官方单请求行为；显式开启才生效。
-    ap.add_argument("--race", action="store_true",
-                    help="D 赛马：把每个内容拆成 n=1 多请求并发，先到为主图（早交付）")
-    ap.add_argument("--coverage-first", dest="coverage_first", action="store_true",
-                    help="E 覆盖优先：多内容时先凑齐“每种一张”再补备份")
+    # 赛马 / 覆盖优先（D/E）——默认常开（早交付 + 多内容先各凑一张）；用 --no-* 退回官方串行行为。
+    ap.add_argument("--no-race", dest="race", action="store_false", default=True,
+                    help="关闭赛马（默认开）：退回每内容单请求 n=N 一次拿齐")
+    ap.add_argument("--no-coverage-first", dest="coverage_first", action="store_false", default=True,
+                    help="关闭覆盖优先（默认开）：退回按内容顺序、一个内容补满再下一个")
     # 受阻 SOP（H）
     ap.add_argument("--block-after", dest="block_after", type=int, default=90,
                     help="持续零出图多少秒判为受阻（默认 90）")
@@ -1279,7 +1299,7 @@ def main():
     # Key 来源
     ap.add_argument("--keys", default=None, help="逗号分隔的裸 API Key（多 Key 即开启健康调度）")
     ap.add_argument("--secrets-file", dest="secrets_file", default=None,
-                    help="secrets.env 路径（读 MATSCA_API_KEY/MATSCA_API_KEYS）")
+                    help="本地 secrets.env 路径（读其中 MATSCA_API_KEYS=，本来源为准）")
     ap.add_argument("--dev-token", dest="dev_token", default=None, help="dev token（自动列 Key + reveal）")
     ap.add_argument("--email", default=None, help="dev 账号（配合 --password 登录拿 token）")
     ap.add_argument("--password", default=None, help="dev 密码")
@@ -1295,11 +1315,16 @@ def main():
     ap.add_argument("--json-out", dest="json_out", default=None, help="把摘要 JSON 额外写到此文件")
     ap.add_argument("--resume", action="store_true",
                     help="断点续跑：读 outdir/manifest.json，已成功的内容（按 name）直接跳过")
+    return ap
+
+
+def main():
+    ap = build_parser()
     args = ap.parse_args()
 
     keys = resolve_keys(args)
     if not keys:
-        sys.exit("没有可用 Key：用 --keys / --secrets-file / 环境变量 MATSCA_API_KEY(S) / --dev-token")
+        sys.exit("没有可用 Key：用 --keys 临时直传，或在本地 secrets.env 写 MATSCA_API_KEYS= / dev 凭据（自动 reveal）")
     log("可用 Key：%d 把（%s）" % (len(keys), ", ".join(kid for kid, _ in keys)))
 
     # 静态 Key 失效后用 dev 登录补的新鲜 Key 顺手回写本地 secrets，保持“本地为准”、过期自愈。
